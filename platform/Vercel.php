@@ -1,5 +1,6 @@
 <?php
 // https://vercel.com/docs/api#endpoints/deployments/create-a-new-deployment
+// https://github.com/vercel-community/php
 
 function getpath() {
     $_SERVER['firstacceptlanguage'] = strtolower(splitfirst(splitfirst($_SERVER['HTTP_ACCEPT_LANGUAGE'], ';')[0], ',')[0]);
@@ -13,13 +14,14 @@ function getpath() {
         if (isset($_SERVER['HTTP_FLY_FORWARDED_PROTO'])) $_SERVER['REQUEST_SCHEME'] = $_SERVER['HTTP_FLY_FORWARDED_PROTO'];
     }
     $_SERVER['host'] = $_SERVER['REQUEST_SCHEME'] . '://' . $_SERVER['HTTP_HOST'];
-    $_SERVER['referhost'] = explode('/', $_SERVER['HTTP_REFERER'])[2];
+    if (isset($_SERVER['HTTP_REFERER'])) $_SERVER['referhost'] = explode('/', $_SERVER['HTTP_REFERER'])[2];
     $_SERVER['base_path'] = "/";
     if (isset($_SERVER['UNENCODED_URL'])) $_SERVER['REQUEST_URI'] = $_SERVER['UNENCODED_URL'];
     $p = strpos($_SERVER['REQUEST_URI'], '?');
     if ($p > 0) $path = substr($_SERVER['REQUEST_URI'], 0, $p);
     else $path = $_SERVER['REQUEST_URI'];
     $path = path_format(substr($path, strlen($_SERVER['base_path'])));
+    fetchVercelPHPVersion(getConfig('HerokuappId'), getConfig("APIKey"));
     return $path;
 }
 
@@ -301,9 +303,59 @@ function setVercelConfig($envs, $appId, $token) {
     return VercelUpdate($appId, $token, $outPath);
 }
 
+function fetchVercelPHPVersion($appId, $token) {
+    if (!($vercelPHPversion = getcache("PHPRuntime")) || !($nodeVersion = getcache("NodeRuntime"))) {
+        $url = "https://raw.githubusercontent.com/vercel-community/php/master/package.json";
+        $response = curl("GET", $url);
+        if ($response['stat'] == 200) {
+            $res = json_decode($response['body'], true);
+            if ($res) {
+                $phpVersion = $res['version'];
+                $nodeVersion = $res['devDependencies']['@types/node'];
+                $nodeVersion = splitfirst($nodeVersion, ".")[0] . ".x";
+                savecache("PHPRuntime", $phpVersion);
+                savecache("NodeRuntime", $nodeVersion);
+                $vercelPHPversion = $phpVersion;
+            }
+        }
+    }
+    if ($token) {
+        if (!($vercelNodeVersion = getcache("VercelNodeRuntime"))) {
+            $vercelNodeVersion = fetchVercelNodeVersion($appId, $token);
+            if ($vercelNodeVersion != "") savecache("VercelNodeRuntime", $vercelNodeVersion);
+        }
+        //echo "<br>phpNode:" . $nodeVersion . ", vercelNode:" . $vercelNodeVersion;
+        if ($nodeVersion != "" && $nodeVersion != $vercelNodeVersion) {
+            setNodeVersion($nodeVersion, $appId, $token);
+        }
+    }
+    return $vercelPHPversion;
+}
+function fetchVercelNodeVersion($appId, $token) {
+    $url = "https://api.vercel.com/v8/projects/" . $appId;
+    $header["Authorization"] = "Bearer " . $token;
+    $response = curl("GET", $url, "", $header);
+    //echo $url . "<br>\n";
+    //var_dump($response);
+    if ($response['stat'] == 200) {
+        $result = json_decode($response['body'], true);
+        return $result['nodeVersion'];
+    } else {
+        return "";
+    }
+}
+function setNodeVersion($ver, $appId, $token) {
+    $url = "https://api.vercel.com/v9/projects/" . $appId;
+    $header["Authorization"] = "Bearer " . $token;
+    $header["Content-Type"] = "application/json";
+    $data["nodeVersion"] = $ver;
+    //echo "<br>Set node " . $ver;
+    $response = curl("PATCH", $url, json_encode($data), $header);
+}
+
 function VercelUpdate($appId, $token, $sourcePath = "") {
     if (checkBuilding($appId, $token)) return '{"error":{"message":"Another building is in progress."}}';
-    $vercelPHPversion = "0.6.1";
+    $vercelPHPversion = fetchVercelPHPVersion($appId, $token);
     $url = "https://api.vercel.com/v13/deployments";
     $header["Authorization"] = "Bearer " . $token;
     $header["Content-Type"] = "application/json";
@@ -314,6 +366,10 @@ function VercelUpdate($appId, $token, $sourcePath = "") {
     $data["name"] = "OneManager";
     $data["project"] = $appId;
     $data["target"] = "production";
+    if (getcache("NodeRuntime")) {
+        $data["projectSettings"]["nodeVersion"] = getcache("NodeRuntime");
+        $data["projectSettings"]["framework"] = null;
+    }
     if ($sourcePath == "") $sourcePath = splitlast(splitlast(__DIR__, "/")[0], "/")[0];
     //echo $sourcePath . "<br>";
     getEachFiles($file, $sourcePath);
@@ -387,14 +443,20 @@ function OnekeyUpate($GitSource = 'Github', $auth = 'qkqpttgf', $project = 'OneM
     $tmppath = '/tmp';
 
     if ($GitSource == 'Github') {
-        // 从github下载对应tar.gz，并解压
-        $url = 'https://github.com/' . $auth . '/' . $project . '/tarball/' . urlencode($branch) . '/';
-    } elseif ($GitSource == 'HITGitlab') {
-        $url = 'https://git.hit.edu.cn/' . $auth . '/' . $project . '/-/archive/' . urlencode($branch) . '/' . $project . '-' . urlencode($branch) . '.tar.gz';
+        // 从github下载对应zip，并解压
+        $url = 'https://codeload.github.com/' . $auth . '/' . $project . '/zip/refs/heads/' . urlencode($branch);
+    } elseif ($GitSource == 'Gitee') {
+        $url = 'https://gitee.com/' . $auth . '/' . $project . '/repository/archive/' . urlencode($branch) . '.zip';
     } else return json_encode(['error' => ['code' => 'Git Source input Error!']]);
 
-    $tarfile = $tmppath . '/github.tar.gz';
-    file_put_contents($tarfile, file_get_contents($url));
+    $tarfile = $tmppath . '/github.zip';
+    $context_options = array(
+        'http' => array(
+            'header' => "User-Agent: curl/7.83.1",
+        )
+    );
+    $context = stream_context_create($context_options);
+    file_put_contents($tarfile, file_get_contents($url, false, $context));
     $phar = new PharData($tarfile);
     $html = $phar->extractTo($tmppath, null, true); //路径 要解压的文件 是否覆盖
     unlink($tarfile);
